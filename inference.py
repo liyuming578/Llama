@@ -6,9 +6,10 @@ import torch
 def inference():
     torch.manual_seed(1)
 
-    tokenizer_path = "/data/leig/llama2-7b/tokenizer.model"
-    model_path = "/data/leig/llama2-7b/consolidated.00.pth"
-
+    tokenizer_path = "/data1/llama2-7b/tokenizer.model"
+    # model_path = "/data1/llama2-7b/consolidated.00.pth"
+    model_path = "checkpoint_5.pth"
+    
     tokenizer = Tokenizer(tokenizer_path)
 
     checkpoint = torch.load(model_path, map_location="cpu")
