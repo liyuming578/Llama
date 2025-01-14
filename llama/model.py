@@ -18,7 +18,7 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = 32000  
+    vocab_size: int = 32000
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
@@ -93,7 +93,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return freqs_cis  # (end, dim // 2)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -402,7 +402,7 @@ class Llama(Generation):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )

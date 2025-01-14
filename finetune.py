@@ -51,7 +51,7 @@ def preprocess(sources, targets, tokenizer):
     input_ids = examples_tokenized["input_ids"]
     labels = copy.deepcopy(input_ids)
     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len-1] = IGNORE_INDEX
+        label[:source_len - 1] = IGNORE_INDEX
     return dict(input_ids=input_ids, labels=labels)
 
 
@@ -88,6 +88,7 @@ class SupervisedDataset(Dataset):
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
+
     def __call__(self, instances):
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -109,11 +110,10 @@ def make_supervised_data_module(tokenizer, data_path):
 
 
 def train():
-
     torch.manual_seed(1)
 
-    model_path = "/data1/llama2-7b/consolidated.00.pth"
-    tokenizer_path = "/data1/llama2-7b/tokenizer.model"
+    model_path = "consolidated.00.pth"
+    tokenizer_path = "tokenizer.model"
     # data_path = "/data1/llama2-7b/alpaca_data_dummy.json"
     data_path = "alpaca_data_200.json"
     # load model
@@ -136,14 +136,14 @@ def train():
         collate_fn=data_module["data_collator"],
         shuffle=True,
     )
-    
+
     # Freeze model parameters other than lora weights
     for name, params in model.named_parameters():
         if "lora_" in name:
             params.requires_grad = True
         else:
             params.requires_grad = False
-    
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())
     print(
@@ -209,7 +209,7 @@ def train():
             if accumulation_counter % num_accumulation_steps == 0 or accumulation_counter == len(dataloader) - 1:
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad(set_to_none = True)
+                optimizer.zero_grad(set_to_none=True)
                 # accumulation_counter = 0
                 memory = torch.cuda.max_memory_allocated() / 1e9
                 print(f"Loss: {loss.item() * num_accumulation_steps:.4f}, Memory: {memory:.2f}GB")
@@ -219,6 +219,7 @@ def train():
     end_time = time.time()
     print(f"Training took {end_time - start_time:.2f} seconds")
     torch.save(model.state_dict(), f'checkpoint_{n_epochs}.pth')
+
 
 if __name__ == "__main__":
     train()

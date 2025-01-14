@@ -7,9 +7,9 @@ from typing import Optional, List
 
 class LoRALayer():
     def __init__(
-        self, 
-        r: int, 
-        lora_alpha: int, 
+        self,
+        r: int,
+        lora_alpha: int,
         lora_dropout: float,
         merge_weights: bool,
     ):
@@ -28,11 +28,11 @@ class LoRALayer():
 class Linear(nn.Linear, LoRALayer):
     # LoRA implemented in a dense layer
     def __init__(
-        self, 
-        in_features: int, 
-        out_features: int, 
-        r: int = 0, 
-        lora_alpha: int = 1, 
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 0,
+        lora_alpha: int = 1,
         lora_dropout: float = 0.,
         fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         merge_weights: bool = True,
@@ -76,13 +76,13 @@ class Linear(nn.Linear, LoRALayer):
                 # Merge the weights and mark it
                 if self.r > 0:
                     self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
-                self.merged = True       
+                self.merged = True
 
     def forward(self, x: torch.Tensor):
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w
         if self.r > 0 and not self.merged:
-            result = F.linear(x, T(self.weight), bias=self.bias)            
+            result = F.linear(x, T(self.weight), bias=self.bias)
             result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
             return result
         else:

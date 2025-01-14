@@ -10,8 +10,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from llama.generation import Generation
-import llama.lora as lora
-from torch.utils.checkpoint import checkpoint
+
+import copy
+
 
 @dataclass
 class ModelArgs:
@@ -25,8 +26,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     max_batch_size: int = 4
-    max_seq_len: int = 256
-    lora: bool = True
+    max_seq_len: int = 128
 
 
 class RMSNorm(torch.nn.Module):
@@ -75,27 +75,34 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(dim: int, end: int, batch_size: int, theta: float = 10000.0):
     """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions and batch size.
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim',
+    the end index 'end', and scales the frequencies using the 'theta' parameter. The returned tensor contains
+    complex values in complex64 data type and includes a batch size dimension.
 
     Args:
         dim (int): Dimension of the frequency tensor.
         end (int): End index for precomputing frequencies.
+        batch_size (int): The number of batches for the frequency tensor.
         theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
 
     Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
+        torch.Tensor: Precomputed frequency tensor with complex exponentials, shaped to include batch size.
     """
+    # Calculate the frequencies based on the given dimension and scaling factor
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    # Create a time index tensor
+    t = torch.arange(end)
+    # Calculate the outer product to get the full frequency matrix
+    freqs = torch.outer(t, freqs).float()
+    # Convert to complex exponential form
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # Repeat the tensor along a new batch dimension
+    freqs_cis = freqs_cis.unsqueeze(0).repeat(batch_size, 1, 1)
+    return freqs_cis  # Shape: (batch_size, end, dim / 2)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -118,15 +125,16 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    print(f"freqs_cis.shape is {freqs_cis.shape}, x.shape is {x.shape}")
+    assert freqs_cis.shape == (x.shape[0], x.shape[1], x.shape[-1])
+    shape = [d if i == 0 or i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)  # (bsz, seqlen, 1, head_dim)
 
 
 def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -166,6 +174,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -194,20 +203,33 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        if args.lora:
-            self.wq = lora.Linear(args.dim, args.n_heads * self.head_dim, bias=False, r=8)
-            self.wv = lora.Linear(args.dim, args.n_heads * self.head_dim, bias=False, r=8)
-        else:
-            self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-            self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            start_pos: int,
+            freqs_cis: torch.Tensor
     ):
         """
         Forward pass of the attention module.
@@ -231,25 +253,65 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        self.cache_k[:bsz, start_pos: start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos: start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        xv = xv.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+
+# --------------------------------------------------------------------------------------------------------------------
+        if seqlen > 1:  # prefilling stage
+            last_scores = scores[:, :, -1, :]  # (bs, n_local_heads, cache_len + seqlen)
+            average_scores = torch.mean(last_scores, dim=1)  # (bs, cache_len + seqlen)
+            k = max(2, int(0.95 * average_scores.shape[-1]))  # select top k%
+            top_indices = torch.topk(average_scores, k, dim=-1, largest=True, sorted=False)[1].sort(dim=-1)[
+                0]  # (bs, k)
+
+            # Creating an index matrix with shape (bsz, cache_len + seqlen)
+            all_indices = torch.arange(average_scores.shape[-1], device=average_scores.device).repeat(bsz, 1)
+
+            # Creating a mask with the same shape as all_indices
+            mask = torch.ones_like(all_indices, dtype=torch.bool)  # (bsz, cache_len + seqlen)
+
+            # Setting top_indices to False in the mask using scatter_
+            # Make sure top_indices are broadcasted correctly across the dimension where scatter is applied
+            mask.scatter_(1, top_indices, False)  # Apply mask to top indices
+
+            # Getting the removed indices based on the mask
+            removed_indices = all_indices[mask].view(bsz, -1)  # (bsz, cache_len + seqlen - k)
+
+            #  reshape for torch.gather
+            top_indices = top_indices.unsqueeze(-1).expand(-1, -1, output.size(-1))
+            pruned_output = torch.gather(output, 1, top_indices)
+            return self.wo(pruned_output), top_indices, removed_indices
+        else:  # decoding stage
+            return self.wo(output)
+# --------------------------------------------------------------------------------------------------------------------
 
 
 class FeedForward(nn.Module):
     def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
+            self,
+            dim: int,
+            hidden_dim: int,
+            multiple_of: int,
+            ffn_dim_multiplier: Optional[float],
     ):
         """
         Initialize the FeedForward module.
@@ -316,30 +378,71 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
+        self.start_pos = 0
+        self.freqs_cis = precompute_freqs_cis(
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
+            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+            self.dim // self.n_heads, args.max_seq_len * 2, args.max_batch_size
+        )
+
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            removed_indices: torch.Tensor,
+            freqs_cis1: torch.Tensor
     ):
         """
         Perform a forward pass through the TransformerBlock.
 
         Args:
             x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
-            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention.forward(
-            self.attention_norm(x), freqs_cis, mask
-        )
+        # -------------------------------------------------------------------------------------------------------
+        bsz = x.shape[0]
+        seq_len = x.shape[1]
+        self.freqs_cis.to(x.device)
+
+        if seq_len > 1:  # prefilling stage
+            if self.layer_id == 0:
+                freqs_cis = self.freqs_cis[:bsz, self.start_pos: self.start_pos + seq_len]
+            else:
+                #  -----------------------------------------------------------------------------------------------------
+                self.freqs_cis = freqs_cis1
+
+                batch_size, seqlen, dim_half = self.freqs_cis.shape
+
+                all_indices = torch.arange(seqlen, device=self.freqs_cis.device).unsqueeze(0).expand(batch_size, -1)
+
+                mask = torch.ones(batch_size, seqlen, dtype=torch.bool, device=self.freqs_cis.device)
+
+                mask.scatter_(1, removed_indices, False)
+
+                keep_indices = all_indices[mask].view(batch_size, -1)
+
+                self.freqs_cis = torch.gather(
+                    self.freqs_cis,
+                    1,
+                    keep_indices.unsqueeze(-1).expand(batch_size, keep_indices.size(1), dim_half)
+                )
+                #  -----------------------------------------------------------------------------------------------------
+                freqs_cis = self.freqs_cis[:bsz, self.start_pos: self.start_pos + seq_len]
+
+            attention, top_indices, removed_indices = self.attention.forward(self.attention_norm(x), self.start_pos, freqs_cis)
+            h = torch.gather(x, 1, top_indices) + attention
+            self.start_pos = self.start_pos + seq_len
+
+        # -------------------------------------------------------------------------------------------------------
+        else:  # decoding stage
+            freqs_cis = self.freqs_cis[:bsz, self.start_pos: self.start_pos + seq_len]
+            h = x + self.attention.forward(self.attention_norm(x), self.start_pos, freqs_cis)
+            self.start_pos += seq_len
+
         out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out
+        return out, removed_indices, self.freqs_cis
 
 
 class Llama(Generation):
@@ -375,13 +478,7 @@ class Llama(Generation):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
-            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
-        )
-
-    def forward(self, tokens: torch.Tensor):
+    def forward(self, tokens: torch.Tensor, start_pos: int):
         """
         Perform a forward pass through the Transformer model.
 
@@ -394,33 +491,14 @@ class Llama(Generation):
 
         """
         _bsz, seqlen = tokens.shape
-        # if seqlen > self.params.max_seq_len * 2:
-        #     tokens = tokens[:, :self.params.max_seq_len*2]
-        #     seqlen = self.params.max_seq_len * 2
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[:seqlen]
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
-
-            mask = torch.triu(mask, diagonal=1)
-
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            # mask = torch.hstack([
-            #     torch.zeros((seqlen, start_pos), device=tokens.device),
-            #     mask
-            # ]).type_as(h)
+        removed_indices = None
+        freqs_cis = None
 
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
-            # h = checkpoint(layer, h, freqs_cis, mask)
+            print(h.shape)
+            h, removed_indices, freqs_cis = layer(h, removed_indices, freqs_cis)
         h = self.norm(h)
         output = self.output(h).float()
+
         return output

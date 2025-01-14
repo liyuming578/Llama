@@ -36,9 +36,9 @@ class Generation(nn.Module):
             tokens[:, cur_pos] = next_token
 
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == tokenizer.eos_id
+                    next_token == tokenizer.eos_id
             )
- 
+
             prev_pos = cur_pos
             if all(eos_reached):
                 break
@@ -47,7 +47,7 @@ class Generation(nn.Module):
         for i, toks in enumerate(tokens.tolist()):
             # cut to max gen len
             start = len(prompt_tokens[i])
-            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            toks = toks[start: len(prompt_tokens[i]) + max_gen_len]
 
             # cut to eos tok if any
             if tokenizer.eos_id in toks:
